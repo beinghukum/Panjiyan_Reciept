@@ -115,19 +115,20 @@ def handle(msg):
     text = msg.get("text", "").strip()
 
     if chat not in users:
-        users[chat] = {"chat_id": chat, "step": "start"}
+        users[chat] = {"chat_id": chat, "step": "menu"}
 
     user = users[chat]
 
-    # START
-    if text == "/start":
+    # ---------------- ALWAYS SHOW MENU ----------------
+    if user["step"] == "menu":
         send_keyboard(chat, "Select option:", [
             ["📄 Get Receipt"]
         ])
-        user["step"] = "menu"
+        user["step"] = "wait_menu"
+        return
 
-    # MENU BUTTON
-    elif text == "📄 Get Receipt":
+    # ---------------- MENU CLICK ----------------
+    if text == "📄 Get Receipt":
         districts = get_districts()
 
         keyboard = []
@@ -144,15 +145,17 @@ def handle(msg):
 
         send_keyboard(chat, "जिला चुनें:", keyboard)
         user["step"] = "district"
+        return
 
-    # DISTRICT SELECT
-    elif user["step"] == "district":
+    # ---------------- DISTRICT ----------------
+    if user["step"] == "district":
         user["district"] = text
         send_msg(chat, "Enter किसान कोड / मोबाइल / समग्र:")
         user["step"] = "code"
+        return
 
-    # CODE INPUT
-    elif user["step"] == "code":
+    # ---------------- CODE ----------------
+    if user["step"] == "code":
         user["code"] = text
 
         captcha = get_captcha(user)
@@ -160,9 +163,10 @@ def handle(msg):
 
         send_msg(chat, "Enter CAPTCHA:")
         user["step"] = "captcha"
+        return
 
-    # CAPTCHA INPUT
-    elif user["step"] == "captcha":
+    # ---------------- CAPTCHA ----------------
+    if user["step"] == "captcha":
         user["captcha"] = text
 
         send_msg(chat, "⏳ Processing...")
@@ -173,7 +177,11 @@ def handle(msg):
         except Exception as e:
             send_msg(chat, f"❌ Error: {str(e)}")
 
-        user["step"] = "start"
+        user["step"] = "menu"
+        return
+
+    # ---------------- DEFAULT FALLBACK ----------------
+    user["step"] = "menu"
 
 # ---------------- RUN BOT ----------------
 def run_bot():
