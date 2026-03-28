@@ -1,3 +1,4 @@
+
 import requests
 import time
 import threading
@@ -9,7 +10,7 @@ BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 users = {}
 
-# ---------------- FLASK (FOR RENDER FREE) ----------------
+# ---------------- FLASK ----------------
 app = Flask(__name__)
 
 @app.route("/")
@@ -26,11 +27,15 @@ def send_msg(chat_id, text):
         "text": text
     })
 
-def send_inline(chat_id, text, buttons):
+def send_keyboard(chat_id, text, buttons):
     requests.post(f"{BASE}/sendMessage", json={
         "chat_id": chat_id,
         "text": text,
-        "reply_markup": {"inline_keyboard": buttons}
+        "reply_markup": {
+            "keyboard": buttons,
+            "resize_keyboard": True,
+            "one_time_keyboard": True
+        }
     })
 
 def send_photo(chat_id, path):
@@ -51,7 +56,7 @@ def get_districts():
 
         page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
 
-        options = page.locator("select#ContentPlaceHolder1_ddlDistrict option").all_text_contents()
+        options = page.locator("#ContentPlaceHolder1_ddlDistrict option").all_text_contents()
 
         browser.close()
 
@@ -66,17 +71,15 @@ def get_captcha(user):
         page = browser.new_page()
 
         page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
-
         page.select_option("#ContentPlaceHolder1_ddlDistrict", label=user["district"])
 
-        # better selector for captcha image
         page.locator("#ContentPlaceHolder1_imgCaptcha").screenshot(path=file)
 
         browser.close()
 
     return file
 
-# ---------------- PDF GENERATION ----------------
+# ---------------- PDF ----------------
 def generate_pdf(user):
     file = f"{user['chat_id']}.pdf"
 
@@ -98,7 +101,6 @@ def generate_pdf(user):
         page.click("text=प्रिंट करे")
         page.wait_for_timeout(3000)
 
-        # scale to fit A4 in one page
         page.add_style_tag(content="body { zoom:0.6 }")
 
         page.pdf(path=file, format="A4", print_background=True)
@@ -110,19 +112,46 @@ def generate_pdf(user):
 # ---------------- BOT LOGIC ----------------
 def handle(msg):
     chat = msg["chat"]["id"]
-    text = msg.get("text", "")
+    text = msg.get("text", "").strip()
 
     if chat not in users:
         users[chat] = {"chat_id": chat, "step": "start"}
 
     user = users[chat]
 
+    # START
     if text == "/start":
-        send_inline(chat, "Select option:", [
-            [{"text": "📄 Get Receipt", "callback_data": "receipt"}]
+        send_keyboard(chat, "Select option:", [
+            ["📄 Get Receipt"]
         ])
         user["step"] = "menu"
 
+    # MENU BUTTON
+    elif text == "📄 Get Receipt":
+        districts = get_districts()
+
+        keyboard = []
+        row = []
+
+        for d in districts:
+            row.append(d)
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+
+        if row:
+            keyboard.append(row)
+
+        send_keyboard(chat, "जिला चुनें:", keyboard)
+        user["step"] = "district"
+
+    # DISTRICT SELECT
+    elif user["step"] == "district":
+        user["district"] = text
+        send_msg(chat, "Enter किसान कोड / मोबाइल / समग्र:")
+        user["step"] = "code"
+
+    # CODE INPUT
     elif user["step"] == "code":
         user["code"] = text
 
@@ -132,6 +161,7 @@ def handle(msg):
         send_msg(chat, "Enter CAPTCHA:")
         user["step"] = "captcha"
 
+    # CAPTCHA INPUT
     elif user["step"] == "captcha":
         user["captcha"] = text
 
@@ -145,40 +175,7 @@ def handle(msg):
 
         user["step"] = "start"
 
-# ---------------- CALLBACK HANDLER ----------------
-def handle_callback(cb):
-    chat = cb["message"]["chat"]["id"]
-    data = cb["data"]
-
-    if chat not in users:
-        users[chat] = {"chat_id": chat}
-
-    user = users[chat]
-
-    if data == "receipt":
-        districts = get_districts()
-
-        buttons = []
-        row = []
-
-        for d in districts:
-            row.append({"text": d, "callback_data": f"dist_{d}"})
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-
-        if row:
-            buttons.append(row)
-
-        send_inline(chat, "जिला चुनें:", buttons)
-        user["step"] = "district"
-
-    elif data.startswith("dist_"):
-        user["district"] = data.replace("dist_", "")
-        send_msg(chat, "Enter किसान कोड / मोबाइल / समग्र:")
-        user["step"] = "code"
-
-# ---------------- LONG POLLING ----------------
+# ---------------- RUN BOT ----------------
 def run_bot():
     offset = 0
     while True:
@@ -189,10 +186,7 @@ def run_bot():
             for upd in res.get("result", []):
                 offset = upd["update_id"] + 1
 
-                if "callback_query" in upd:
-                    handle_callback(upd["callback_query"])
-
-                elif "message" in upd:
+                if "message" in upd:
                     handle(upd["message"])
 
         except Exception as e:
