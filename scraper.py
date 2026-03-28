@@ -113,7 +113,12 @@ class KisanScraper:
         sess.kisan_code = kisan_code
 
         logger.info("Loading page for user %s", user_id)
-        await page.goto(TARGET_URL, wait_until="networkidle", timeout=30_000)
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
+        # Wait for the district dropdown to be ready (more reliable than networkidle)
+        try:
+            await page.wait_for_selector("select", timeout=15_000)
+        except Exception:
+            logger.warning("Select not found after load, proceeding anyway")
         await self._debug_dump(page, "01_loaded")
 
         await self._select_district(page, district)
@@ -250,7 +255,7 @@ class KisanScraper:
 
         # ASP.NET postback — wait for DOM to settle on same page
         try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
+            await page.wait_for_load_state("domcontentloaded", timeout=15_000)
         except Exception:
             pass
         await page.wait_for_timeout(1500)
@@ -411,7 +416,7 @@ class KisanScraper:
             async with sess.context.expect_page(timeout=15_000) as new_info:
                 await element.click()
             new_page = await new_info.value
-            await new_page.wait_for_load_state("networkidle", timeout=25_000)
+            await new_page.wait_for_load_state("domcontentloaded", timeout=25_000)
             await self._wait_for_content(new_page)
             logger.info("Receipt page (new tab): %s", new_page.url)
             return new_page
@@ -423,7 +428,7 @@ class KisanScraper:
                     await element.click()
             except Exception:
                 await page.wait_for_timeout(2000)
-            await page.wait_for_load_state("networkidle", timeout=25_000)
+            await page.wait_for_load_state("domcontentloaded", timeout=25_000)
             await self._wait_for_content(page)
             logger.info("Receipt page (same tab): %s", page.url)
             return page
@@ -434,7 +439,7 @@ class KisanScraper:
                 async with sess.context.expect_page(timeout=8_000) as new_info:
                     await element.click()
                 new_page = await new_info.value
-                await new_page.wait_for_load_state("networkidle", timeout=20_000)
+                await new_page.wait_for_load_state("domcontentloaded", timeout=20_000)
                 await self._wait_for_content(new_page)
                 logger.info("Receipt page (new tab fallback): %s", new_page.url)
                 return new_page
@@ -444,7 +449,7 @@ class KisanScraper:
                         await element.click()
                 except Exception:
                     await page.wait_for_timeout(2000)
-                await page.wait_for_load_state("networkidle", timeout=15_000)
+                await page.wait_for_load_state("domcontentloaded", timeout=15_000)
                 await self._wait_for_content(page)
                 logger.info("Receipt page (same tab fallback): %s", page.url)
                 return page
@@ -480,7 +485,7 @@ class KisanScraper:
         Farmers with 10+ khasra rows may need 2 pages — that is acceptable.
         """
         # Wait for Hindi fonts, logo, and table data to fully render
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
 
         # Verify page has real content before generating PDF
         body = (await page.inner_text("body")).strip()
