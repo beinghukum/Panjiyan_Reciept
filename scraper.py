@@ -64,7 +64,11 @@ class KisanScraper:
                         "--disable-dev-shm-usage",
                         "--disable-gpu",
                         "--no-zygote",
-                        "--single-process",  # required on Render containers
+                        "--single-process",
+                        "--disable-web-security",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                        "--ignore-certificate-errors",
+                        "--disable-blink-features=AutomationControlled",
                     ],
                 )
                 logger.info("Browser launched.")
@@ -75,7 +79,19 @@ class KisanScraper:
             context = await self._browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 locale="hi-IN",
-                extra_http_headers={"Accept-Language": "hi-IN,hi;q=0.9,en;q=0.8"},
+                # Realistic Chrome user-agent — prevents gov site from blocking headless browser
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                extra_http_headers={
+                    "Accept-Language": "hi-IN,hi;q=0.9,en-IN;q=0.8,en;q=0.7",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                },
             )
             page = await context.new_page()
             self._sessions[user_id] = UserSession(context, page)
@@ -113,12 +129,33 @@ class KisanScraper:
         sess.kisan_code = kisan_code
 
         logger.info("Loading page for user %s", user_id)
-        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
-        # Wait for the district dropdown to be ready (more reliable than networkidle)
-        try:
-            await page.wait_for_selector("select", timeout=15_000)
-        except Exception:
-            logger.warning("Select not found after load, proceeding anyway")
+
+        # Retry page load up to 3 times — government sites can be slow/flaky
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                logger.info("Page load attempt %d/3", attempt)
+                await page.goto(
+                    TARGET_URL,
+                    wait_until="load",    # 'load' fires after HTML+CSS+images, before XHR
+                    timeout=90_000,       # 90s — generous for slow gov site
+                )
+                # Confirm the district select is actually present
+                await page.wait_for_selector("select", timeout=20_000)
+                logger.info("Page loaded successfully on attempt %d", attempt)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning("Attempt %d failed: %s", attempt, e)
+                if attempt < 3:
+                    await page.wait_for_timeout(3000)  # wait 3s before retry
+        if last_error:
+            raise Exception(
+                f"पोर्टल लोड नहीं हुआ ({last_error})\n"
+                "सरकारी वेबसाइट अभी उपलब्ध नहीं है। कुछ देर बाद /start से कोशिश करें।"
+            )
+
         await self._debug_dump(page, "01_loaded")
 
         await self._select_district(page, district)

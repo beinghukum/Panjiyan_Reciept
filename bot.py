@@ -264,11 +264,16 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
+        per_message=False,   # suppress PTBUserWarning
     )
 
     app.add_handler(conv)
+
     logger.info("Bot starting...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
