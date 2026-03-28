@@ -1,3 +1,4 @@
+
 import requests
 import time
 from playwright.sync_api import sync_playwright
@@ -8,11 +9,18 @@ BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 users = {}
 
 # -------- TELEGRAM --------
-def send_msg(chat_id, text, kb=None):
-    data = {"chat_id": chat_id, "text": text}
-    if kb:
-        data["reply_markup"] = {"keyboard": kb, "resize_keyboard": True}
-    requests.post(f"{BASE}/sendMessage", json=data)
+def send_msg(chat_id, text):
+    requests.post(f"{BASE}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text
+    })
+
+def send_inline(chat_id, text, buttons):
+    requests.post(f"{BASE}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": buttons}
+    })
 
 def send_photo(chat_id, path):
     requests.post(f"{BASE}/sendPhoto",
@@ -24,7 +32,21 @@ def send_doc(chat_id, path):
                   data={"chat_id": chat_id},
                   files={"document": open(path, "rb")})
 
-# -------- CAPTCHA FETCH --------
+# -------- FETCH DISTRICTS --------
+def get_districts():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
+
+        options = page.locator("select#ContentPlaceHolder1_ddlDistrict option").all_text_contents()
+
+        browser.close()
+
+    return [o.strip() for o in options if o.strip() and "चुनें" not in o]
+
+# -------- CAPTCHA --------
 def get_captcha(user):
     file = f"{user['chat_id']}_captcha.png"
 
@@ -33,16 +55,15 @@ def get_captcha(user):
         page = browser.new_page()
 
         page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
-        page.select_option("select", label=user["district"])
+        page.select_option("#ContentPlaceHolder1_ddlDistrict", label=user["district"])
 
-        # correct captcha selector
         page.locator("img").first.screenshot(path=file)
 
         browser.close()
 
     return file
 
-# -------- PDF GENERATION --------
+# -------- PDF --------
 def generate_pdf(user):
     file = f"{user['chat_id']}.pdf"
 
@@ -52,7 +73,7 @@ def generate_pdf(user):
 
         page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
 
-        page.select_option("select", label=user["district"])
+        page.select_option("#ContentPlaceHolder1_ddlDistrict", label=user["district"])
 
         inputs = page.locator("input[type='text']")
         inputs.nth(0).fill(user["code"])
@@ -78,44 +99,70 @@ def handle(msg):
     text = msg.get("text", "")
 
     if chat not in users:
-        users[chat] = {"step": "start", "chat_id": chat}
+        users[chat] = {"chat_id": chat, "step": "start"}
 
-    u = users[chat]
+    user = users[chat]
 
     if text == "/start":
-        send_msg(chat, "Select option:", [["📄 Receipt"]])
-        u["step"] = "menu"
+        send_inline(chat, "Select option:", [
+            [{"text": "📄 Get Receipt", "callback_data": "receipt"}]
+        ])
+        user["step"] = "menu"
 
-    elif u["step"] == "menu":
-        send_msg(chat, "जिला चुनें:", [["धार"], ["इंदौर"], ["उज्जैन"]])
-        u["step"] = "district"
+    elif user["step"] == "code":
+        user["code"] = text
 
-    elif u["step"] == "district":
-        u["district"] = text
-        send_msg(chat, "Enter किसान कोड / मोबाइल / समग्र:")
-        u["step"] = "code"
-
-    elif u["step"] == "code":
-        u["code"] = text
-
-        captcha_path = get_captcha(u)
-        send_photo(chat, captcha_path)
+        captcha = get_captcha(user)
+        send_photo(chat, captcha)
 
         send_msg(chat, "Enter CAPTCHA:")
-        u["step"] = "captcha"
+        user["step"] = "captcha"
 
-    elif u["step"] == "captcha":
-        u["captcha"] = text
+    elif user["step"] == "captcha":
+        user["captcha"] = text
 
         send_msg(chat, "⏳ Processing...")
 
         try:
-            pdf = generate_pdf(u)
+            pdf = generate_pdf(user)
             send_doc(chat, pdf)
         except Exception as e:
             send_msg(chat, f"❌ Error: {str(e)}")
 
-        u["step"] = "start"
+        user["step"] = "start"
+
+# -------- CALLBACK --------
+def handle_callback(cb):
+    chat = cb["message"]["chat"]["id"]
+    data = cb["data"]
+
+    if chat not in users:
+        users[chat] = {"chat_id": chat}
+
+    user = users[chat]
+
+    if data == "receipt":
+        districts = get_districts()
+
+        buttons = []
+        row = []
+
+        for d in districts:
+            row.append({"text": d, "callback_data": f"dist_{d}"})
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+
+        if row:
+            buttons.append(row)
+
+        send_inline(chat, "जिला चुनें:", buttons)
+        user["step"] = "district"
+
+    elif data.startswith("dist_"):
+        user["district"] = data.replace("dist_", "")
+        send_msg(chat, "Enter किसान कोड / मोबाइल / समग्र:")
+        user["step"] = "code"
 
 # -------- LONG POLLING --------
 def run():
@@ -127,13 +174,18 @@ def run():
 
             for upd in res.get("result", []):
                 offset = upd["update_id"] + 1
-                if "message" in upd:
+
+                if "callback_query" in upd:
+                    handle_callback(upd["callback_query"])
+
+                elif "message" in upd:
                     handle(upd["message"])
 
         except Exception as e:
-            print("ERR:", e)
+            print("Error:", e)
 
         time.sleep(1)
 
+# -------- RUN --------
 if __name__ == "__main__":
     run()
