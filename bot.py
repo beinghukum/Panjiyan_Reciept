@@ -1,31 +1,50 @@
-
 import requests
 import time
 from playwright.sync_api import sync_playwright
 
 BOT_TOKEN = "8756937178:AAHrVGNMhetcZuqPsv3QstlsTr7qPoeslyA"
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 users = {}
 
-# ---------------- TELEGRAM ----------------
-def send_message(chat_id, text, keyboard=None):
+# -------- TELEGRAM --------
+def send_msg(chat_id, text, kb=None):
     data = {"chat_id": chat_id, "text": text}
-    if keyboard:
-        data["reply_markup"] = {"keyboard": keyboard, "resize_keyboard": True}
-    requests.post(f"{BASE_URL}/sendMessage", json=data)
+    if kb:
+        data["reply_markup"] = {"keyboard": kb, "resize_keyboard": True}
+    requests.post(f"{BASE}/sendMessage", json=data)
 
 def send_photo(chat_id, path):
-    files = {"photo": open(path, "rb")}
-    requests.post(f"{BASE_URL}/sendPhoto", data={"chat_id": chat_id}, files=files)
+    requests.post(f"{BASE}/sendPhoto",
+                  data={"chat_id": chat_id},
+                  files={"photo": open(path, "rb")})
 
-def send_document(chat_id, path):
-    files = {"document": open(path, "rb")}
-    requests.post(f"{BASE_URL}/sendDocument", data={"chat_id": chat_id}, files=files)
+def send_doc(chat_id, path):
+    requests.post(f"{BASE}/sendDocument",
+                  data={"chat_id": chat_id},
+                  files={"document": open(path, "rb")})
 
-# ---------------- PLAYWRIGHT ----------------
-def process_receipt(user):
-    file_path = f"{user['chat_id']}.pdf"
+# -------- CAPTCHA FETCH --------
+def get_captcha(user):
+    file = f"{user['chat_id']}_captcha.png"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
+        page.select_option("select", label=user["district"])
+
+        # correct captcha selector
+        page.locator("img").first.screenshot(path=file)
+
+        browser.close()
+
+    return file
+
+# -------- PDF GENERATION --------
+def generate_pdf(user):
+    file = f"{user['chat_id']}.pdf"
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -33,114 +52,88 @@ def process_receipt(user):
 
         page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
 
-        # Select district
         page.select_option("select", label=user["district"])
 
-        # Enter code
-        page.fill("input[type='text']", user["code"])
+        inputs = page.locator("input[type='text']")
+        inputs.nth(0).fill(user["code"])
+        inputs.nth(1).fill(user["captcha"])
 
-        # Fill captcha
-        page.fill("input[type='text'] >> nth=1", user["captcha"])
-
-        # Submit
         page.click("text=किसान सर्च करे")
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(4000)
 
-        # Click print
         page.click("text=प्रिंट करे")
         page.wait_for_timeout(3000)
 
-        # Force A4 one page
-        page.add_style_tag(content="body { zoom: 0.6 }")
+        page.add_style_tag(content="body { zoom:0.6 }")
 
-        page.pdf(path=file_path, format="A4", print_background=True)
+        page.pdf(path=file, format="A4", print_background=True)
 
         browser.close()
 
-    return file_path
+    return file
 
-# ---------------- BOT LOGIC ----------------
-def handle_message(msg):
-    chat_id = msg["chat"]["id"]
+# -------- BOT LOGIC --------
+def handle(msg):
+    chat = msg["chat"]["id"]
     text = msg.get("text", "")
 
-    if chat_id not in users:
-        users[chat_id] = {"step": "start", "chat_id": chat_id}
+    if chat not in users:
+        users[chat] = {"step": "start", "chat_id": chat}
 
-    user = users[chat_id]
+    u = users[chat]
 
-    # START
     if text == "/start":
-        send_message(chat_id, "Select option:", [["📄 Get Receipt"]])
-        user["step"] = "menu"
+        send_msg(chat, "Select option:", [["📄 Receipt"]])
+        u["step"] = "menu"
 
-    # MENU
-    elif user["step"] == "menu" and "Receipt" in text:
-        districts = [
-            ["धार"], ["इंदौर"], ["उज्जैन"],
-            ["देवास"], ["खरगोन"], ["बड़वानी"]
-        ]
-        send_message(chat_id, "जिला चुनें:", districts)
-        user["step"] = "district"
+    elif u["step"] == "menu":
+        send_msg(chat, "जिला चुनें:", [["धार"], ["इंदौर"], ["उज्जैन"]])
+        u["step"] = "district"
 
-    # DISTRICT
-    elif user["step"] == "district":
-        user["district"] = text
-        send_message(chat_id, "किसान कोड / मोबाइल / समग्र दर्ज करें:")
-        user["step"] = "code"
+    elif u["step"] == "district":
+        u["district"] = text
+        send_msg(chat, "Enter किसान कोड / मोबाइल / समग्र:")
+        u["step"] = "code"
 
-    # CODE
-    elif user["step"] == "code":
-        user["code"] = text
+    elif u["step"] == "code":
+        u["code"] = text
 
-        # get captcha image
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            page = browser.new_page()
-            page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
+        captcha_path = get_captcha(u)
+        send_photo(chat, captcha_path)
 
-            page.select_option("select", label=user["district"])
+        send_msg(chat, "Enter CAPTCHA:")
+        u["step"] = "captcha"
 
-            page.screenshot(path=f"{chat_id}_captcha.png")
-            browser.close()
+    elif u["step"] == "captcha":
+        u["captcha"] = text
 
-        send_photo(chat_id, f"{chat_id}_captcha.png")
-        send_message(chat_id, "Enter CAPTCHA:")
-        user["step"] = "captcha"
-
-    # CAPTCHA
-    elif user["step"] == "captcha":
-        user["captcha"] = text
-
-        send_message(chat_id, "⏳ Processing...")
+        send_msg(chat, "⏳ Processing...")
 
         try:
-            pdf = process_receipt(user)
-            send_document(chat_id, pdf)
+            pdf = generate_pdf(u)
+            send_doc(chat, pdf)
         except Exception as e:
-            send_message(chat_id, f"❌ Error: {e}")
+            send_msg(chat, f"❌ Error: {str(e)}")
 
-        user["step"] = "start"
+        u["step"] = "start"
 
-# ---------------- LONG POLLING ----------------
-def run_bot():
+# -------- LONG POLLING --------
+def run():
     offset = 0
     while True:
         try:
-            res = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 30}).json()
+            res = requests.get(f"{BASE}/getUpdates",
+                               params={"offset": offset, "timeout": 30}).json()
 
-            for update in res.get("result", []):
-                offset = update["update_id"] + 1
-
-                if "message" in update:
-                    handle_message(update["message"])
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                if "message" in upd:
+                    handle(upd["message"])
 
         except Exception as e:
-            print("Error:", e)
+            print("ERR:", e)
 
         time.sleep(1)
 
-# ---------------- RUN ----------------
 if __name__ == "__main__":
-    run_bot()
-
+    run()
