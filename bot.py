@@ -2,7 +2,7 @@ from playwright.sync_api import sync_playwright
 import requests
 import time
 
-BOT_TOKEN = "YOUR_TOKEN"
+BOT_TOKEN = "8756937178:AAHrVGNMhetcZuqPsv3QstlsTr7qPoeslyA"
 
 def send_document(chat_id, file_path):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
