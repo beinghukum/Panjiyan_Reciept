@@ -1,6 +1,7 @@
-
 import requests
 import time
+import threading
+from flask import Flask
 from playwright.sync_api import sync_playwright
 
 BOT_TOKEN = "8756937178:AAHrVGNMhetcZuqPsv3QstlsTr7qPoeslyA"
@@ -8,7 +9,17 @@ BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 users = {}
 
-# -------- TELEGRAM --------
+# ---------------- FLASK (FOR RENDER FREE) ----------------
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+def run_web():
+    app.run(host="0.0.0.0", port=10000)
+
+# ---------------- TELEGRAM ----------------
 def send_msg(chat_id, text):
     requests.post(f"{BASE}/sendMessage", json={
         "chat_id": chat_id,
@@ -32,7 +43,7 @@ def send_doc(chat_id, path):
                   data={"chat_id": chat_id},
                   files={"document": open(path, "rb")})
 
-# -------- FETCH DISTRICTS --------
+# ---------------- FETCH DISTRICTS ----------------
 def get_districts():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -46,7 +57,7 @@ def get_districts():
 
     return [o.strip() for o in options if o.strip() and "चुनें" not in o]
 
-# -------- CAPTCHA --------
+# ---------------- CAPTCHA ----------------
 def get_captcha(user):
     file = f"{user['chat_id']}_captcha.png"
 
@@ -55,15 +66,17 @@ def get_captcha(user):
         page = browser.new_page()
 
         page.goto("https://mpeuparjan.mp.gov.in/euparjanmp/WPMS2026/frm_Rabi_FarmerDetails.aspx")
+
         page.select_option("#ContentPlaceHolder1_ddlDistrict", label=user["district"])
 
-        page.locator("img").first.screenshot(path=file)
+        # better selector for captcha image
+        page.locator("#ContentPlaceHolder1_imgCaptcha").screenshot(path=file)
 
         browser.close()
 
     return file
 
-# -------- PDF --------
+# ---------------- PDF GENERATION ----------------
 def generate_pdf(user):
     file = f"{user['chat_id']}.pdf"
 
@@ -85,6 +98,7 @@ def generate_pdf(user):
         page.click("text=प्रिंट करे")
         page.wait_for_timeout(3000)
 
+        # scale to fit A4 in one page
         page.add_style_tag(content="body { zoom:0.6 }")
 
         page.pdf(path=file, format="A4", print_background=True)
@@ -93,7 +107,7 @@ def generate_pdf(user):
 
     return file
 
-# -------- BOT LOGIC --------
+# ---------------- BOT LOGIC ----------------
 def handle(msg):
     chat = msg["chat"]["id"]
     text = msg.get("text", "")
@@ -131,7 +145,7 @@ def handle(msg):
 
         user["step"] = "start"
 
-# -------- CALLBACK --------
+# ---------------- CALLBACK HANDLER ----------------
 def handle_callback(cb):
     chat = cb["message"]["chat"]["id"]
     data = cb["data"]
@@ -164,8 +178,8 @@ def handle_callback(cb):
         send_msg(chat, "Enter किसान कोड / मोबाइल / समग्र:")
         user["step"] = "code"
 
-# -------- LONG POLLING --------
-def run():
+# ---------------- LONG POLLING ----------------
+def run_bot():
     offset = 0
     while True:
         try:
@@ -186,6 +200,7 @@ def run():
 
         time.sleep(1)
 
-# -------- RUN --------
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    run()
+    threading.Thread(target=run_web).start()
+    run_bot()
