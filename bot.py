@@ -7,6 +7,8 @@ import asyncio
 import logging
 import os
 import tempfile
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -43,6 +45,8 @@ DISTRICTS = [
 ]
 
 BOT_TOKEN = "8756937178:AAHrVGNMhetcZuqPsv3QstlsTr7qPoeslyA"
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is not set!")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -221,7 +225,28 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+# ── Health check server (keeps Render service alive) ──────────────────────────
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK - Kisan Bot Running")
+    def log_message(self, *args):
+        pass  # suppress noisy HTTP logs
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    logger.info("Health server running on port %d", port)
+    server.serve_forever()
+
+
 def main():
+    # Start health check HTTP server in background thread (required for Render)
+    threading.Thread(target=_start_health_server, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(

@@ -1,22 +1,20 @@
 """
 scraper.py — Browser automation for mpeuparjan.mp.gov.in
-Exact selectors derived from live page inspection (screenshots).
+Uses Playwright (async) + Chrome DevTools Protocol (CDP) for exact print output.
 
 Page flow:
   1. frm_Rabi_FarmerDetails.aspx  — district select + kisan code + captcha
   2. Same page after ASP.NET postback — shows farmer info
      + "आवेदन पर्ची प्रिंट करने के लिए क्लिक करे" link
-  3. PrintRegForm.aspx — receipt with "प्रिंट करे"
+  3. PrintRegForm.aspx — receipt page → PDF via CDP Page.printToPDF
 """
-import pyautogui
-import time
+
 import asyncio
+import base64
 import logging
 import os
 from pathlib import Path
 from typing import Dict, Optional
-import pyautogui
-import time
 
 from playwright.async_api import (
     async_playwright, Browser, BrowserContext, Page, Playwright, ElementHandle
@@ -54,64 +52,19 @@ class KisanScraper:
 
     # ── Browser lifecycle ──────────────────────────────────────────────────────
 
-
-    async def _generate_pdf(self, page: Page) -> bytes:
-        """
-        EXACT Chrome-like print output
-        """
-
-        # Step 1: Trigger print page
-        await page.evaluate("__doPostBack('btnPrint','')")
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(2000)
-
-        # 🔥 Step 2: IMPORTANT → Apply PRINT MODE
-        await page.emulate_media(media="print")
-
-        # 🔥 Step 3: Remove green background via CSS (same as Chrome)
-        await page.add_style_tag(content="""
-            body {
-                background: white !important;
-            }
-
-            * {
-                background-color: transparent !important;
-            }
-
-            table {
-                width: 100% !important;
-                border-collapse: collapse !important;
-            }
-        """)
-
-        # Step 4: Use Chrome print engine
-        client = await page.context.new_cdp_session(page)
-
-        pdf = await client.send("Page.printToPDF", {
-            "printBackground": False,   # 🔥 KEY (removes green)
-            "paperWidth": 8.27,
-            "paperHeight": 11.69,
-            "marginTop": 0.4,
-            "marginBottom": 0.4,
-            "marginLeft": 0.4,
-            "marginRight": 0.4,
-            "scale": 0.99,              # match Chrome custom scale
-            "preferCSSPageSize": True
-        })
-
-        import base64
-        return base64.b64decode(pdf['data'])
-
     async def _ensure_browser(self):
         async with self._lock:
             if self._browser is None or not self._browser.is_connected():
                 self._playwright = await async_playwright().start()
                 self._browser = await self._playwright.chromium.launch(
-                    headless=False,
+                    headless=True,          # must be True on Render
                     args=[
                         "--no-sandbox",
                         "--disable-setuid-sandbox",
                         "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--no-zygote",
+                        "--single-process",  # required on Render containers
                     ],
                 )
                 logger.info("Browser launched.")
@@ -170,7 +123,7 @@ class KisanScraper:
         return await self._capture_captcha(page)
 
     async def _select_district(self, page: Page, district: str):
-        """Select district from the <select> dropdown."""
+        """Select district from the <select> dropdown. Real ID: ddlDistrict"""
         selects = await page.query_selector_all("select")
         logger.info("Found %d <select> elements", len(selects))
         for sel_el in selects:
@@ -196,7 +149,6 @@ class KisanScraper:
 
     async def _fill_kisan_code(self, page: Page, kisan_code: str):
         """Fill the kisan code input. Real ID confirmed: txt_SearchID"""
-        # Try known real IDs first (from log: input#txt_SearchID)
         known_ids = ["txt_SearchID", "txtSearchID", "txtKisanCode", "txtMobile"]
         for kid in known_ids:
             el = await page.query_selector(f"#{kid}")
@@ -236,7 +188,6 @@ class KisanScraper:
                 break
 
         if not captcha_el:
-            # Scan all images for captcha-like src
             for img in await page.query_selector_all("img"):
                 src = (await img.get_attribute("src") or "").lower()
                 if any(k in src for k in ["captcha", "code", "validate", "verify"]):
@@ -306,21 +257,18 @@ class KisanScraper:
 
         await self._debug_dump(page, "03_after_search")
 
-        # Check page text for errors / farmer data
+        # Check page text for errors
         body_text = await page.inner_text("body")
-        logger.info("Body after search (first 400 chars): %r", body_text[:400])
+        logger.info("Body after search (first 400): %r", body_text[:400])
 
-        # CAPTCHA error detection
         captcha_err = ["गलत", "wrong captcha", "invalid captcha", "captcha incorrect"]
         if any(w in body_text.lower() for w in captcha_err):
             raise CaptchaError("CAPTCHA गलत है")
 
-        # Find "आवेदन पर्ची प्रिंट करने के लिए क्लिक करे"
+        # Find receipt link
         receipt_link = await self._find_receipt_link(page)
         if receipt_link is None:
             await self._debug_dump(page, "03x_no_receipt_found")
-            # Build a helpful error with what we actually see
-            preview = body_text[:300].strip()
             raise Exception(
                 "आवेदन पर्ची लिंक नहीं मिला।\n\n"
                 "संभावित कारण:\n"
@@ -330,11 +278,11 @@ class KisanScraper:
                 "/start से दोबारा कोशिश करें।"
             )
 
-        # Click receipt link (may open new tab or navigate same tab)
+        # Click receipt link → get PrintRegForm.aspx page
         receipt_page = await self._click_receipt_link(sess, receipt_link)
         await self._debug_dump(receipt_page, "04_receipt_page")
 
-        # Generate PDF
+        # Generate PDF using CDP
         pdf_bytes = await self._generate_pdf(receipt_page)
         try:
             await receipt_page.close()
@@ -343,12 +291,7 @@ class KisanScraper:
         return pdf_bytes
 
     async def _fill_captcha_input(self, page: Page, captcha_text: str):
-        """
-        Fill the CAPTCHA text box.
-        From Image 1: it's the text input right next to the CAPTCHA image.
-        Strategy: find input whose ID/name contains captcha-like words,
-        else use the LAST visible text input (kisan code is first, captcha is last).
-        """
+        """Fill the CAPTCHA text box — last visible text input on page."""
         patterns = [
             "input[id*='aptcha']",
             "input[id*='Captcha']",
@@ -373,20 +316,14 @@ class KisanScraper:
             last = visible[-1]
             iid = await last.get_attribute("id") or "?"
             logger.info("CAPTCHA fallback → last visible input#%s", iid)
-            await last.click(click_count=3)
             await last.fill(captcha_text)
         elif visible:
-            await visible[0].click(click_count=3)
             await visible[0].fill(captcha_text)
         else:
             logger.error("No visible text inputs found for CAPTCHA!")
 
     async def _click_search_button(self, page: Page):
-        """
-        Click "किसान सर्च करे" (the green button from Image 1).
-        It's rendered as <input type="button" value="किसान सर्च करे">
-        Avoid "नया" (reset) and "Captcha बदले" buttons.
-        """
+        """Click 'किसान सर्च करे' — skip reset/captcha buttons."""
         skip_values = ["नया", "captcha बदले", "बदले", "reset", "clear"]
         search_values = ["किसान सर्च", "सर्च करे", "search", "खोज"]
 
@@ -399,7 +336,6 @@ class KisanScraper:
             val = (await btn.get_attribute("value") or "").strip()
             bid = await btn.get_attribute("id") or "?"
             logger.info("  btn id=%r value=%r", bid, val)
-
             val_lower = val.lower()
             if any(s in val_lower for s in skip_values):
                 continue
@@ -423,10 +359,7 @@ class KisanScraper:
         logger.error("Search button not found!")
 
     async def _find_receipt_link(self, page: Page) -> Optional[ElementHandle]:
-        """
-        Find "आवेदन पर्ची प्रिंट करने के लिए क्लिक करे" link.
-        From Image 1: it's a plain blue <a> hyperlink below the form.
-        """
+        """Find 'आवेदन पर्ची प्रिंट करने के लिए क्लिक करे' link."""
         receipt_keywords = [
             "आवेदन पर्ची प्रिंट करने के लिए क्लिक करे",
             "आवेदन पर्ची",
@@ -435,7 +368,6 @@ class KisanScraper:
             "PrintRegForm",
         ]
 
-        # Check all <a> tags
         links = await page.query_selector_all("a")
         logger.info("Scanning %d <a> tags for receipt link", len(links))
         for lnk in links:
@@ -450,7 +382,7 @@ class KisanScraper:
             except Exception:
                 pass
 
-        # Check input buttons too (ASP.NET LinkButton)
+        # ASP.NET LinkButton fallback
         btns = await page.query_selector_all(
             "input[type='button'], input[type='submit'], button"
         )
@@ -465,41 +397,45 @@ class KisanScraper:
 
     async def _click_receipt_link(self, sess: UserSession, element: ElementHandle) -> Page:
         """
-        Click the receipt link and return the resulting page.
-        Handles both new-tab (target=_blank) and same-tab navigation.
+        Click receipt link and return the loaded PrintRegForm.aspx page.
+        NEVER use page.goto() here — it loses the ASP.NET session.
+        Click naturally so cookies stay intact.
         """
         page = sess.page
         target = (await element.get_attribute("target") or "").strip()
-        href = (await element.get_attribute("href") or "").strip()
+        href   = (await element.get_attribute("href")   or "").strip()
         logger.info("Receipt link: target=%r href=%r", target, href)
 
         if target == "_blank":
-            # Opens in new tab
+            # Opens in a new tab
             async with sess.context.expect_page(timeout=15_000) as new_info:
                 await element.click()
             new_page = await new_info.value
-            await new_page.wait_for_load_state("networkidle", timeout=20_000)
+            await new_page.wait_for_load_state("networkidle", timeout=25_000)
+            await self._wait_for_content(new_page)
             logger.info("Receipt page (new tab): %s", new_page.url)
             return new_page
 
         elif "PrintRegForm" in href or href.endswith(".aspx"):
-            # Relative/absolute URL — navigate in same tab
+            # Same-tab navigation
             try:
                 async with page.expect_navigation(timeout=15_000):
                     await element.click()
             except Exception:
                 await page.wait_for_timeout(2000)
-            await page.wait_for_load_state("networkidle", timeout=20_000)
+            await page.wait_for_load_state("networkidle", timeout=25_000)
+            await self._wait_for_content(page)
             logger.info("Receipt page (same tab): %s", page.url)
             return page
 
         else:
-            # __doPostBack or unknown — try new tab first, fallback same tab
+            # Unknown — try new tab first, fall back to same tab
             try:
                 async with sess.context.expect_page(timeout=8_000) as new_info:
                     await element.click()
                 new_page = await new_info.value
                 await new_page.wait_for_load_state("networkidle", timeout=20_000)
+                await self._wait_for_content(new_page)
                 logger.info("Receipt page (new tab fallback): %s", new_page.url)
                 return new_page
             except Exception:
@@ -509,7 +445,97 @@ class KisanScraper:
                 except Exception:
                     await page.wait_for_timeout(2000)
                 await page.wait_for_load_state("networkidle", timeout=15_000)
+                await self._wait_for_content(page)
                 logger.info("Receipt page (same tab fallback): %s", page.url)
                 return page
 
-    
+    async def _wait_for_content(self, page: Page, timeout_ms: int = 10_000):
+        """Wait until page body has meaningful content (not blank)."""
+        import time
+        start = time.time()
+        while (time.time() - start) * 1000 < timeout_ms:
+            try:
+                body = (await page.inner_text("body")).strip()
+                if len(body) > 100:
+                    logger.info("Page content ready (%d chars)", len(body))
+                    return
+            except Exception:
+                pass
+            await page.wait_for_timeout(300)
+        logger.warning("Content wait timed out — proceeding anyway")
+
+    # ── PDF Generation via CDP ─────────────────────────────────────────────────
+
+    async def _generate_pdf(self, page: Page) -> bytes:
+        """
+        Generate PDF using Chrome DevTools Protocol Page.printToPDF.
+        This gives the exact same output as clicking "Print" in Chrome.
+
+        Why CDP instead of page.pdf():
+        - page.pdf() ignores CSS @media print rules on some ASP.NET pages
+        - CDP printToPDF is the actual Chrome print engine — same as Ctrl+P
+        - Matches the hemkunwar.pdf reference exactly
+
+        Scale 0.82 on A4 fits all farmer details + khasra table on one page.
+        Farmers with 10+ khasra rows may need 2 pages — that is acceptable.
+        """
+        # Wait for Hindi fonts, logo, and table data to fully render
+        await page.wait_for_timeout(2000)
+
+        # Verify page has real content before generating PDF
+        body = (await page.inner_text("body")).strip()
+        logger.info("Receipt body preview: %r", body[:200])
+        if len(body) < 50:
+            raise Exception(
+                "Receipt page is blank — session expired.\n"
+                "/start से दोबारा कोशिश करें।"
+            )
+
+        # Inject minimal CSS:
+        # - Hide top nav links (पीछे जाये / प्रिंट करे) from PDF
+        # - Prevent table horizontal overflow
+        await page.add_style_tag(content="""
+            /* Hide top navigation links in PDF output */
+            body > center:first-child,
+            body > div:first-child > a,
+            body > p:first-child { display: none !important; }
+
+            /* Prevent horizontal overflow in tables */
+            table {
+                width: 100% !important;
+                table-layout: fixed !important;
+                word-break: break-word !important;
+                border-collapse: collapse !important;
+            }
+            td, th {
+                word-break: break-word !important;
+                overflow-wrap: break-word !important;
+            }
+            img { max-width: 100% !important; }
+        """)
+
+        # Switch to print media so @media print CSS rules apply
+        await page.emulate_media(media="print")
+        await page.wait_for_timeout(500)  # let print styles settle
+
+        # Use CDP Page.printToPDF — exact Chrome print engine
+        cdp = await page.context.new_cdp_session(page)
+        result = await cdp.send("Page.printToPDF", {
+            "printBackground": True,    # keep green receipt background
+            "paperWidth":  8.27,        # A4 width in inches
+            "paperHeight": 11.69,       # A4 height in inches
+            "marginTop":    0.4,        # ~10mm
+            "marginBottom": 0.4,
+            "marginLeft":   0.31,       # ~8mm
+            "marginRight":  0.31,
+            "scale": 0.82,             # tuned to fit receipt on 1 page
+            "preferCSSPageSize": False,
+        })
+        await cdp.detach()
+
+        pdf_bytes = base64.b64decode(result["data"])
+        if not pdf_bytes:
+            raise Exception("CDP PDF generation returned empty data.")
+
+        logger.info("CDP PDF generated: %d bytes", len(pdf_bytes))
+        return pdf_bytes
